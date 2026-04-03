@@ -1,0 +1,63 @@
+# ──────────────────────────────────────────────
+#  Android
+# ──────────────────────────────────────────────
+*.iml
+.gradle/
+local.properties
+.DS_Store
+/build/
+/captures/
+.externalNativeBuild/
+.cxx/
+
+# ──────────────────────────────────────────────
+#  Android Studio / IntelliJ IDEA
+# ──────────────────────────────────────────────
+.idea/
+*.iws
+*.ipr
+out/
+# Keep these IDEA files (shared project settings)
+!.idea/codeStyles/
+!.idea/inspectionProfiles/
+!.idea/scopes/
+
+# ──────────────────────────────────────────────
+#  Kotlin / Gradle
+# ──────────────────────────────────────────────
+.kotlin/
+*.class
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+gradle-app.setting
+!gradle-wrapper.jar
+.gradletasknamecache
+
+# ──────────────────────────────────────────────
+#  Build outputs
+# ──────────────────────────────────────────────
+app/build/
+**/build/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.so
+
+# ──────────────────────────────────────────────
+#  Signing / secrets (NEVER commit these)
+# ──────────────────────────────────────────────
+*.jks
+*.keystore
+keystore.properties
+release.properties
+secrets.properties
+
+# ──────────────────────────────────────────────
+#  OS files
+# ──────────────────────────────────────────────
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.vscode/
