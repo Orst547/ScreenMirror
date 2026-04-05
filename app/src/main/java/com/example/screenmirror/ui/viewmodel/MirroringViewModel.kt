@@ -11,6 +11,9 @@ import com.example.screenmirror.data.network.nsd.NetworkDiscoveryManager
 import com.example.screenmirror.data.network.dlna.DlnaDiscoveryManager
 import com.example.screenmirror.domain.models.DeviceProtocol
 import com.example.screenmirror.domain.models.MirrorRoute
+import com.google.android.gms.cast.framework.CastContext
+import com.google.android.gms.cast.framework.CastSession
+import com.google.android.gms.cast.framework.SessionManagerListener
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -43,6 +46,16 @@ class MirroringViewModel(context: Context) : ViewModel() {
     private val nsdDiscovery      = NetworkDiscoveryManager(appContext)
     private val miracastDiscovery = MiracastDiscoveryManager(appContext)
     private val dlnaDiscovery     = DlnaDiscoveryManager(appContext)
+
+    // El CastContext debe inicializarse en el hilo principal
+    private var castContext: CastContext? = null
+    init {
+        try {
+            castContext = CastContext.getSharedInstance(appContext)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error inicializando CastContext: ${e.message}")
+        }
+    }
 
     private val _availableRoutes = MutableStateFlow<List<MirrorRoute>>(emptyList())
     val availableRoutes: StateFlow<List<MirrorRoute>> = _availableRoutes.asStateFlow()
@@ -93,8 +106,9 @@ class MirroringViewModel(context: Context) : ViewModel() {
         _selectedRoute.value = route
         Log.d(TAG, "Route selected: ${route.name} (${route.protocol.displayName})")
 
-        // Request screen-capture permission regardless of protocol —
-        // actual connection logic will live in MirroringService
+        // Si es Chromecast, el SDK maneja la selección internamente a través de MediaRouter
+        // pero nosotros disparamos el MediaProjection para capturar la pantalla.
+        
         val projectionManager = appContext.getSystemService(Context.MEDIA_PROJECTION_SERVICE)
                 as android.media.projection.MediaProjectionManager
         onPermissionRequired(projectionManager.createScreenCaptureIntent())

@@ -61,14 +61,30 @@ class DlnaDiscoveryManager(private val context: Context) {
         socket.soTimeout = 3000 // 3-second timeout
 
         try {
-            // Explicitly find and set the Wi-Fi network interface for multicast
+            // Encontrar la interfaz de red activa que soporte Multicast (Wi-Fi preferentemente)
             val interfaces = NetworkInterface.getNetworkInterfaces()
-            val wifiInterface = Collections.list(interfaces).firstOrNull { 
-                it.isUp && it.supportsMulticast() && !it.isLoopback && (it.name.contains("wlan") || it.name.contains("eth"))
+            var wifiInterface: NetworkInterface? = null
+            var localAddress: InetAddress? = null
+
+            for (networkInterface in Collections.list(interfaces)) {
+                if (networkInterface.isUp && networkInterface.supportsMulticast() && !networkInterface.isLoopback) {
+                    val addresses = networkInterface.inetAddresses
+                    for (addr in Collections.list(addresses)) {
+                        if (addr is java.net.Inet4Address && !addr.isLoopbackAddress) {
+                            wifiInterface = networkInterface
+                            localAddress = addr
+                            break
+                        }
+                    }
+                }
+                if (wifiInterface != null) break
             }
             
-            if (wifiInterface != null) {
+            if (wifiInterface != null && localAddress != null) {
+                // Vincular el socket a la dirección local para evitar errores EPERM en Android 14+
                 socket.networkInterface = wifiInterface
+            } else {
+                Log.w(TAG, "No se encontró una interfaz Wi-Fi compatible con Multicast")
             }
 
             // M-SEARCH Message

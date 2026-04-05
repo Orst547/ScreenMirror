@@ -9,6 +9,7 @@ import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
+import android.media.MediaCodecInfo.CodecProfileLevel
 import android.media.MediaFormat
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
@@ -29,7 +30,8 @@ import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import io.ktor.utils.io.*
 import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
 import java.io.OutputStream
 import java.nio.ByteBuffer
 
@@ -49,7 +51,9 @@ class MirroringService : Service() {
     
     // Ktor Server & Muxing
     private var ktorServer: EmbeddedServer<*, *>? = null
-    private val tsPacketFlow = MutableSharedFlow<ByteArray>(extraBufferCapacity = 64)
+    // Canal de alto rendimiento para los paquetes TS (evita el lag de las coroutines por cada bloque)
+    private val tsPacketChannel = Channel<ByteArray>(capacity = 128, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+    private val tsPacketCount = java.util.concurrent.atomic.AtomicInteger(0)
     private var muxer: MpegTsMuxer? = null
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
@@ -61,13 +65,14 @@ class MirroringService : Service() {
     }
 
     private fun setupMuxer() {
-        // Muxer writes to an OutputStream that broadcasts to the Flow
+        // El Muxer escribe a un OutputStream que envía directamente al Canal
         val broadcastStream = object : OutputStream() {
             override fun write(b: Int) { /* unused */ }
             override fun write(b: ByteArray, off: Int, len: Int) {
                 val chunk = b.copyOfRange(off, off + len)
-                serviceScope.launch {
-                    tsPacketFlow.emit(chunk)
+                // Usamos trySend para que la escritura sea instantánea y no bloquee el hilo del encoder
+                if (tsPacketChannel.trySend(chunk).isSuccess) {
+                    tsPacketCount.incrementAndGet()
                 }
             }
         }
@@ -79,9 +84,14 @@ class MirroringService : Service() {
             routing {
                 get("/live.ts") {
                     call.respondBytesWriter(contentType = io.ktor.http.ContentType.Video.MPEG) {
-                        tsPacketFlow.collect { chunk ->
-                            writeFully(chunk)
-                            flush()
+                        for (chunk in tsPacketChannel) {
+                            tsPacketCount.decrementAndGet()
+                            try {
+                                writeFully(chunk)
+                                flush()
+                            } catch (e: Exception) {
+                                break // Desconexión del cliente
+                            }
                         }
                     }
                 }
@@ -141,14 +151,23 @@ class MirroringService : Service() {
             windowManager.defaultDisplay.getMetrics(metrics)
         }
 
-        // 1. Setup MediaCodec (Encoder)
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, metrics.widthPixels, metrics.heightPixels)
+        // 1. Setup MediaCodec (Encoder) con posible escalado a 720p dinámico
+        val useScaling = true // Forzamos escalado para mayor fluidez en redes Wi-Fi
+        val targetWidth = if (useScaling) 720 else metrics.widthPixels
+        val targetHeight = if (useScaling) (metrics.heightPixels * 720 / metrics.widthPixels) else metrics.heightPixels
+
+        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, targetWidth, targetHeight)
         format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-        format.setInteger(MediaFormat.KEY_BIT_RATE, 6000000) // 6Mbps
+        format.setInteger(MediaFormat.KEY_BIT_RATE, 4000000) // Bajamos a 4Mbps para mayor estabilidad
         format.setInteger(MediaFormat.KEY_FRAME_RATE, 30)
         format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
 
         mediaCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        
+        // Forzamos AVCProfileBaseline para maximizar compatibilidad y evitar el bug de Media3
+        format.setInteger(MediaFormat.KEY_PROFILE, CodecProfileLevel.AVCProfileBaseline)
+        format.setInteger(MediaFormat.KEY_LEVEL, CodecProfileLevel.AVCLevel41)
+        
         mediaCodec?.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         inputSurface = mediaCodec?.createInputSurface()
         mediaCodec?.start()
@@ -168,8 +187,8 @@ class MirroringService : Service() {
         // 3. Create VirtualDisplay using the Encoder's Surface
         virtualDisplay = mediaProjection?.createVirtualDisplay(
             "MirroringDisplay",
-            metrics.widthPixels,
-            metrics.heightPixels,
+            targetWidth,
+            targetHeight,
             metrics.densityDpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             inputSurface,
@@ -207,10 +226,37 @@ class MirroringService : Service() {
                 }
                 
                 if (isStreaming) {
+                    // Ajuste de bitrate dinámico basado en la congestión de la cola del Canal
+                    adjustBitrateDynamically()
                     encoderHandler?.post(this)
                 }
             }
         })
+    }
+
+    private var lastBitrateUpdateTime = 0L
+    private var currentBitrate = 4000000
+    private fun adjustBitrateDynamically() {
+        val now = System.currentTimeMillis()
+        if (now - lastBitrateUpdateTime < 1000) return
+
+        val queueSize = tsPacketCount.get()
+        val targetBitrate = if (queueSize > 80) {
+             1000000 // Muy congestionado
+        } else if (queueSize > 40) {
+             2500000 // Algo congestionado
+        } else {
+             4000000 // Fluido
+        }
+        
+        if (targetBitrate != currentBitrate) {
+            currentBitrate = targetBitrate
+            lastBitrateUpdateTime = now
+            val params = android.os.Bundle().apply {
+                putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, currentBitrate)
+            }
+            mediaCodec?.setParameters(params)
+        }
     }
 
     private fun sendDataToRemoteDevice(buffer: ByteBuffer, bufferInfo: MediaCodec.BufferInfo) {

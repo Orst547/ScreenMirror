@@ -14,19 +14,20 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.*
+
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Brush
+//import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
+//import androidx.compose.ui.unit.sp
 import com.example.screenmirror.domain.models.DeviceProtocol
 import com.example.screenmirror.domain.models.MirrorRoute
 import com.example.screenmirror.ui.viewmodel.MirroringViewModel
@@ -148,8 +149,9 @@ fun EnhancedRouteCard(route: MirrorRoute, isSelected: Boolean, onClick: () -> Un
     Surface(
         onClick = onClick,
         shape = RoundedCornerShape(24.dp),
-        color = if (isSelected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.9f) 
-                else MaterialTheme.colorScheme.surface.copy(alpha = 0.7f),
+        color = if (isSelected) MaterialTheme.colorScheme.primaryContainer 
+                else MaterialTheme.colorScheme.surface,
+        tonalElevation = if (isSelected) 8.dp else 2.dp,
         border = androidx.compose.foundation.BorderStroke(
             width = if (isSelected) 2.dp else 1.dp,
             color = if (isSelected) MaterialTheme.colorScheme.primary 
@@ -171,7 +173,7 @@ fun EnhancedRouteCard(route: MirrorRoute, isSelected: Boolean, onClick: () -> Un
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
-                    imageVector = icon,
+                    imageVector = if (isSelected) Icons.Rounded.CastConnected else icon,
                     contentDescription = null,
                     tint = if (isSelected) MaterialTheme.colorScheme.onPrimaryContainer else color,
                     modifier = Modifier.size(28.dp)
