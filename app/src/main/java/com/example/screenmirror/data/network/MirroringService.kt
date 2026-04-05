@@ -1,6 +1,7 @@
 package com.example.screenmirror.data.network
 
 import android.app.*
+import android.util.Log
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -15,14 +16,25 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
+import android.os.Looper
 import android.util.DisplayMetrics
 import android.view.Surface
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
+import com.example.screenmirror.data.network.streaming.MpegTsMuxer
+import io.ktor.server.application.*
+import io.ktor.server.cio.*
+import io.ktor.server.engine.*
+import io.ktor.server.response.*
+import io.ktor.server.routing.*
+import io.ktor.utils.io.*
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableSharedFlow
+import java.io.OutputStream
 import java.nio.ByteBuffer
 
 class MirroringService : Service() {
-
+    
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var mediaCodec: MediaCodec? = null
@@ -34,10 +46,50 @@ class MirroringService : Service() {
     private var isStreaming = false
     private var encoderThread: HandlerThread? = null
     private var encoderHandler: Handler? = null
+    
+    // Ktor Server & Muxing
+    private var ktorServer: EmbeddedServer<*, *>? = null
+    private val tsPacketFlow = MutableSharedFlow<ByteArray>(extraBufferCapacity = 64)
+    private var muxer: MpegTsMuxer? = null
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        setupMuxer()
+        startKtorServer()
+    }
+
+    private fun setupMuxer() {
+        // Muxer writes to an OutputStream that broadcasts to the Flow
+        val broadcastStream = object : OutputStream() {
+            override fun write(b: Int) { /* unused */ }
+            override fun write(b: ByteArray, off: Int, len: Int) {
+                val chunk = b.copyOfRange(off, off + len)
+                serviceScope.launch {
+                    tsPacketFlow.emit(chunk)
+                }
+            }
+        }
+        muxer = MpegTsMuxer(broadcastStream)
+    }
+
+    private fun startKtorServer() {
+        val server = embeddedServer(CIO, port = 8080) {
+            routing {
+                get("/live.ts") {
+                    call.respondBytesWriter(contentType = io.ktor.http.ContentType.Video.MPEG) {
+                        tsPacketFlow.collect { chunk ->
+                            writeFully(chunk)
+                            flush()
+                        }
+                    }
+                }
+            }
+        }
+        ktorServer = server
+        server.start(wait = false)
+        Log.d("MirroringService", "Ktor server started on port 8080")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -105,6 +157,14 @@ class MirroringService : Service() {
         val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         mediaProjection = projectionManager.getMediaProjection(resultCode, data)
 
+        // Android 14+ requires registering a callback before creating VirtualDisplay
+        mediaProjection?.registerCallback(object : MediaProjection.Callback() {
+            override fun onStop() {
+                super.onStop()
+                this@MirroringService.stopSelf()
+            }
+        }, Handler(Looper.getMainLooper()))
+
         // 3. Create VirtualDisplay using the Encoder's Surface
         virtualDisplay = mediaProjection?.createVirtualDisplay(
             "MirroringDisplay",
@@ -154,8 +214,8 @@ class MirroringService : Service() {
     }
 
     private fun sendDataToRemoteDevice(buffer: ByteBuffer, bufferInfo: MediaCodec.BufferInfo) {
-        // TODO: Implement the network protocol (RTSP, TCP socket, etc.)
-        // This is where the bits of video are actually sent to the TV's IP.
+        val isConfig = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+        muxer?.writeVideoFrame(buffer, bufferInfo.presentationTimeUs, isConfig)
     }
 
     private fun createNotificationChannel() {
@@ -180,6 +240,10 @@ class MirroringService : Service() {
         mediaCodec?.stop()
         mediaCodec?.release()
         mediaProjection?.stop()
+        
+        ktorServer?.stop(1000, 2000)
+        serviceScope.cancel()
+        
         super.onDestroy()
     }
 }

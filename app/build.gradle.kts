@@ -9,8 +9,8 @@ android {
 
     defaultConfig {
         applicationId = "com.example.screenmirror"
-        minSdk = 35
-        targetSdk = 36
+        minSdk = 33
+        targetSdk = 35
         versionCode = 1
         versionName = "1.0"
 
@@ -48,6 +48,8 @@ dependencies {
     implementation(libs.androidx.material3)
     implementation(libs.androidx.compose.material.icons.extended)
     implementation(libs.androidx.datastore.preferences)
+    implementation(libs.ktor.server.core)
+    implementation(libs.ktor.server.cio)
     
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)

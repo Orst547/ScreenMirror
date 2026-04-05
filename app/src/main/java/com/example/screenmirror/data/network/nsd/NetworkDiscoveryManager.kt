@@ -4,10 +4,12 @@ import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
+import android.os.Build
 import android.util.Log
 import com.example.screenmirror.domain.models.DeviceProtocol
 import com.example.screenmirror.domain.models.MirrorRoute
 import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.merge
@@ -16,9 +18,6 @@ import java.util.concurrent.Executors
 /**
  * Discovers AirPlay and Chromecast devices on the local network using NSD (mDNS/Bonjour).
  * No external SDKs or servers required — everything runs over the local WiFi.
- *
- * AirPlay  → _airplay._tcp  (Apple TV, HomePod, AirPlay-compatible TVs)
- * Chromecast → _googlecast._tcp  (Chromecast dongles, Google TV, Cast-enabled TVs)
  */
 class NetworkDiscoveryManager(private val context: Context) {
 
@@ -30,30 +29,32 @@ class NetworkDiscoveryManager(private val context: Context) {
         private const val TAG = "NsdDiscovery"
         private const val AIRPLAY_SERVICE_TYPE   = "_airplay._tcp."
         private const val CHROMECAST_SERVICE_TYPE = "_googlecast._tcp."
-        private const val MULTICAST_LOCK_TAG     = "ScreenMirror:MulticastLock"
+        const val MULTICAST_LOCK_TAG = "ScreenMirror:DiscoveryLock"
+        
+        // NsdManager can be buggy if we resolve multiple services at once.
+        // We use a dedicated single-thread executor for all resolutions.
+        private val resolutionExecutor = Executors.newSingleThreadExecutor()
     }
 
     /** Unified flow that emits discovered devices of both AirPlay and Chromecast. */
     fun discoverAllDevices(): Flow<MirrorRoute> =
         merge(
-            discoverServiceType(AIRPLAY_SERVICE_TYPE, DeviceProtocol.AIRPLAY),
-            discoverServiceType(CHROMECAST_SERVICE_TYPE, DeviceProtocol.CHROMECAST)
+            discoverServiceType(AIRPLAY_SERVICE_TYPE, DeviceProtocol.AIRPLAY, delayMs = 0),
+            discoverServiceType(CHROMECAST_SERVICE_TYPE, DeviceProtocol.CHROMECAST, delayMs = 1500)
         )
-
-    // ─── Internal ────────────────────────────────────────────────────────────
 
     private fun discoverServiceType(
         serviceType: String,
-        protocol: DeviceProtocol
+        protocol: DeviceProtocol,
+        delayMs: Long = 0
     ): Flow<MirrorRoute> = callbackFlow {
+        if (delayMs > 0) delay(delayMs)
 
-        // CRITICAL: Android drops mDNS multicast packets unless a MulticastLock is held.
-        // Without this, NsdManager never receives Bonjour/mDNS service announcements.
         val multicastLock = wifiManager.createMulticastLock(MULTICAST_LOCK_TAG).apply {
             setReferenceCounted(true)
             acquire()
         }
-        Log.d(TAG, "[$protocol] MulticastLock acquired")
+        Log.d(TAG, "[$protocol] MulticastLock acquired for $serviceType")
 
         val listener = object : NsdManager.DiscoveryListener {
 
@@ -63,38 +64,60 @@ class NetworkDiscoveryManager(private val context: Context) {
 
             override fun onServiceFound(service: NsdServiceInfo) {
                 Log.d(TAG, "[$protocol] Found: ${service.serviceName}")
-                // API 35+ (minSdk): Use ServiceInfoCallback — the modern, non-deprecated resolve API.
-                val executor = Executors.newSingleThreadExecutor()
-                nsdManager.registerServiceInfoCallback(
-                    service,
-                    executor,
-                    object : NsdManager.ServiceInfoCallback {
-                        override fun onServiceInfoCallbackRegistrationFailed(errorCode: Int) {
-                            Log.e(TAG, "[$protocol] ServiceInfoCallback registration failed: $errorCode")
+                
+                if (Build.VERSION.SDK_INT >= 35) {
+                    // Modern API 35+ Resolution
+                    nsdManager.registerServiceInfoCallback(
+                        service,
+                        resolutionExecutor,
+                        object : NsdManager.ServiceInfoCallback {
+                            override fun onServiceInfoCallbackRegistrationFailed(errorCode: Int) {
+                                Log.e(TAG, "[$protocol] Callback registration failed: $errorCode")
+                            }
+
+                            override fun onServiceUpdated(serviceInfo: NsdServiceInfo) {
+                                handleResolvedService(serviceInfo, protocol)
+                            }
+
+                            override fun onServiceLost() {
+                                Log.d(TAG, "[$protocol] Service lost: ${service.serviceName}")
+                            }
+
+                            override fun onServiceInfoCallbackUnregistered() {
+                                Log.d(TAG, "[$protocol] Callback unregistered for ${service.serviceName}")
+                            }
                         }
-                        override fun onServiceUpdated(serviceInfo: NsdServiceInfo) {
-                            val ip = serviceInfo.hostAddresses.firstOrNull()?.hostAddress
-                            Log.d(TAG, "[$protocol] Resolved '${serviceInfo.serviceName}' @ $ip:${serviceInfo.port}")
-                            val route = MirrorRoute(
-                                id          = "${protocol.name.lowercase()}_${serviceInfo.serviceName}",
-                                name        = serviceInfo.serviceName,
-                                description = "${protocol.displayName} • ${ip ?: ""}",
-                                protocol    = protocol,
-                                ipAddress   = ip,
-                                port        = serviceInfo.port
-                            )
-                            trySend(route)
-                            // Unregister after first successful resolve to avoid duplicate emissions
-                            try { nsdManager.unregisterServiceInfoCallback(this) } catch (_: Exception) {}
+                    )
+                } else {
+                    // Legacy resolveService (Stable for API < 35)
+                    // Note: Parallel resolve calls on the SAME listener often fail,
+                    // so we use a new listener per service.
+                    nsdManager.resolveService(service, object : NsdManager.ResolveListener {
+                        override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
+                            Log.e(TAG, "[$protocol] Resolve failed for ${serviceInfo.serviceName}: $errorCode")
                         }
-                        override fun onServiceLost() {
-                            Log.d(TAG, "[$protocol] ServiceInfoCallback: service lost")
+
+                        override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
+                            handleResolvedService(serviceInfo, protocol)
                         }
-                        override fun onServiceInfoCallbackUnregistered() {
-                            Log.d(TAG, "[$protocol] ServiceInfoCallback unregistered")
-                        }
-                    }
-                )
+                    })
+                }
+            }
+
+            private fun handleResolvedService(serviceInfo: NsdServiceInfo, protocol: DeviceProtocol) {
+                val ip = serviceInfo.hostAddresses.firstOrNull()?.hostAddress
+                if (ip != null) {
+                    Log.d(TAG, "[$protocol] Resolved '${serviceInfo.serviceName}' @ $ip:${serviceInfo.port}")
+                    val route = MirrorRoute(
+                        id          = "${protocol.name.lowercase()}_${serviceInfo.serviceName}",
+                        name        = serviceInfo.serviceName,
+                        description = "${protocol.displayName} • $ip",
+                        protocol    = protocol,
+                        ipAddress   = ip,
+                        port        = serviceInfo.port
+                    )
+                    trySend(route)
+                }
             }
 
             override fun onServiceLost(service: NsdServiceInfo) {
@@ -102,7 +125,7 @@ class NetworkDiscoveryManager(private val context: Context) {
             }
 
             override fun onDiscoveryStopped(serviceType: String) {
-                Log.i(TAG, "[$protocol] Discovery stopped")
+                Log.d(TAG, "[$protocol] Discovery stopped")
             }
 
             override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
@@ -118,7 +141,7 @@ class NetworkDiscoveryManager(private val context: Context) {
         try {
             nsdManager.discoverServices(serviceType, NsdManager.PROTOCOL_DNS_SD, listener)
         } catch (e: Exception) {
-            Log.e(TAG, "[$protocol] Error starting discovery: ${e.message}")
+            Log.e(TAG, "[$protocol] Error initiating discovery: ${e.message}")
             if (multicastLock.isHeld) multicastLock.release()
             close(e)
         }
@@ -131,5 +154,4 @@ class NetworkDiscoveryManager(private val context: Context) {
             }
         }
     }
-
 }

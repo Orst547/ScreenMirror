@@ -6,16 +6,21 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.screenmirror.data.network.miracast.MiracastDiscoveryManager
+import com.example.screenmirror.data.network.MirroringService
 import com.example.screenmirror.data.network.nsd.NetworkDiscoveryManager
+import com.example.screenmirror.data.network.dlna.DlnaDiscoveryManager
 import com.example.screenmirror.domain.models.DeviceProtocol
 import com.example.screenmirror.domain.models.MirrorRoute
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.net.InetAddress
+import java.net.NetworkInterface
 
 /**
  * ViewModel for the main screen.
@@ -24,6 +29,7 @@ import kotlinx.coroutines.launch
  *  • AirPlay   → NSD (_airplay._tcp)
  *  • Chromecast → NSD (_googlecast._tcp)
  *  • Miracast  → Wi-Fi Direct (WifiP2pManager)
+ *  • DLNA      → SSDP
  */
 class MirroringViewModel(context: Context) : ViewModel() {
 
@@ -36,6 +42,7 @@ class MirroringViewModel(context: Context) : ViewModel() {
 
     private val nsdDiscovery      = NetworkDiscoveryManager(appContext)
     private val miracastDiscovery = MiracastDiscoveryManager(appContext)
+    private val dlnaDiscovery     = DlnaDiscoveryManager(appContext)
 
     private val _availableRoutes = MutableStateFlow<List<MirrorRoute>>(emptyList())
     val availableRoutes: StateFlow<List<MirrorRoute>> = _availableRoutes.asStateFlow()
@@ -48,9 +55,14 @@ class MirroringViewModel(context: Context) : ViewModel() {
 
     private var nsdJob      : Job? = null
     private var miracastJob : Job? = null
+    private var dlnaJob     : Job? = null
 
     init {
-        startDiscovery()
+        // Give the OS a moment to settle permissions and network state
+        viewModelScope.launch {
+            delay(1000)
+            startDiscovery()
+        }
     }
 
     // ─── Public API ──────────────────────────────────────────────────────────
@@ -59,6 +71,7 @@ class MirroringViewModel(context: Context) : ViewModel() {
         Log.d(TAG, "Starting local-only device discovery")
         startNsdDiscovery()
         startMiracastDiscovery()
+        startDlnaDiscovery()
     }
 
     /** Re-launch all discovery flows (called by the Refresh button). */
@@ -68,7 +81,12 @@ class MirroringViewModel(context: Context) : ViewModel() {
         _availableRoutes.value = emptyList()
         nsdJob?.cancel()
         miracastJob?.cancel()
-        startDiscovery()
+        dlnaJob?.cancel()
+        
+        viewModelScope.launch {
+            delay(500) // Small delay to let sockets close
+            startDiscovery()
+        }
     }
 
     fun onRouteSelected(route: MirrorRoute, onPermissionRequired: (Intent) -> Unit) {
@@ -83,20 +101,67 @@ class MirroringViewModel(context: Context) : ViewModel() {
     }
 
     fun startMirroring(resultCode: Int, data: Intent) {
+        val route = _selectedRoute.value ?: return
         _isMirroring.value = true
-        Log.d(TAG, "Mirroring started → ${_selectedRoute.value?.name} via ${_selectedRoute.value?.protocol?.displayName}")
-        // TODO: pass resultCode + data to MirroringService and begin streaming
+        Log.d(TAG, "Starting Mirroring to ${route.name} (${route.protocol.displayName})")
+
+        // 1. Start Mirroring Service
+        val serviceIntent = Intent(appContext, MirroringService::class.java).apply {
+            putExtra("RESULT_CODE", resultCode)
+            putExtra("DATA", data)
+        }
+        
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            appContext.startForegroundService(serviceIntent)
+        } else {
+            appContext.startService(serviceIntent)
+        }
+
+        // 2. If it's a DLNA device, command it to play our local stream
+        if (route.protocol == DeviceProtocol.DLNA) {
+            viewModelScope.launch {
+                delay(1500) // Give service/server a moment to start
+                val localIp = getLocalIpAddress()
+                if (localIp != null) {
+                    val streamUrl = "http://$localIp:8080/live.ts"
+                    dlnaDiscovery.castToDevice(route.id, streamUrl)
+                } else {
+                    Log.e(TAG, "Could not determine local IP for DLNA cast")
+                }
+            }
+        }
+    }
+
+    private fun getLocalIpAddress(): String? {
+        try {
+            val en = NetworkInterface.getNetworkInterfaces()
+            while (en.hasMoreElements()) {
+                val intf = en.nextElement()
+                val enumIpAddr = intf.inetAddresses
+                while (enumIpAddr.hasMoreElements()) {
+                    val inetAddress = enumIpAddr.nextElement()
+                    if (!inetAddress.isLoopbackAddress && inetAddress is java.net.Inet4Address) {
+                        return inetAddress.hostAddress
+                    }
+                }
+            }
+        } catch (ex: Exception) {
+            Log.e(TAG, "Error getting local IP: ${ex.message}")
+        }
+        return null
     }
 
     fun stopMirroring() {
         _isMirroring.value = false
         _selectedRoute.value = null
+        appContext.stopService(Intent(appContext, MirroringService::class.java))
         Log.d(TAG, "Mirroring stopped")
     }
 
     override fun onCleared() {
         nsdJob?.cancel()
         miracastJob?.cancel()
+        dlnaJob?.cancel()
         super.onCleared()
     }
 
@@ -138,6 +203,18 @@ class MirroringViewModel(context: Context) : ViewModel() {
                     _availableRoutes.update { current ->
                         // Keep AirPlay + Chromecast; replace all Miracast entries
                         current.filter { it.protocol != DeviceProtocol.MIRACAST } + miracastRoutes
+                    }
+                }
+        }
+    }
+
+    private fun startDlnaDiscovery() {
+        dlnaJob = viewModelScope.launch {
+            dlnaDiscovery.discoverDevices()
+                .catch { e -> Log.e(TAG, "DLNA error: ${e.message}") }
+                .collect { route ->
+                    _availableRoutes.update { current ->
+                        if (current.none { it.id == route.id }) current + route else current
                     }
                 }
         }

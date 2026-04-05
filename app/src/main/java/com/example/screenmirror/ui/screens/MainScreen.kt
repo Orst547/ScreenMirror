@@ -141,6 +141,7 @@ fun EnhancedRouteCard(route: MirrorRoute, isSelected: Boolean, onClick: () -> Un
         DeviceProtocol.CHROMECAST -> Icons.Rounded.Cast    to Color(0xFF4285F4) // Google Blue
         DeviceProtocol.AIRPLAY   -> Icons.Rounded.Airplay  to Color(0xFF555555) // Neutral dark
         DeviceProtocol.MIRACAST  -> Icons.Rounded.Tv       to Color(0xFF43A047) // Green
+        DeviceProtocol.DLNA      -> Icons.Rounded.SettingsInputAntenna to Color(0xFFFF9800) // Orange
         DeviceProtocol.UNKNOWN   -> Icons.Rounded.Devices  to MaterialTheme.colorScheme.primary
     }
 
