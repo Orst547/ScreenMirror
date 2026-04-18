@@ -6,20 +6,24 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.screenmirror.data.network.miracast.MiracastDiscoveryManager
+import com.google.android.gms.cast.framework.CastContext
+import com.google.android.gms.cast.framework.CastSession
+import com.google.android.gms.cast.framework.SessionManagerListener
+import androidx.mediarouter.media.MediaRouter
+import androidx.mediarouter.media.MediaRouteSelector
+import com.google.android.gms.cast.CastMediaControlIntent
 import com.example.screenmirror.data.network.MirroringService
 import com.example.screenmirror.data.network.nsd.NetworkDiscoveryManager
 import com.example.screenmirror.data.network.dlna.DlnaDiscoveryManager
 import com.example.screenmirror.domain.models.DeviceProtocol
 import com.example.screenmirror.domain.models.MirrorRoute
-import com.google.android.gms.cast.framework.CastContext
-import com.google.android.gms.cast.framework.CastSession
-import com.google.android.gms.cast.framework.SessionManagerListener
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.net.InetAddress
@@ -49,11 +53,64 @@ class MirroringViewModel(context: Context) : ViewModel() {
 
     // El CastContext debe inicializarse en el hilo principal
     private var castContext: CastContext? = null
-    init {
-        try {
-            castContext = CastContext.getSharedInstance(appContext)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error inicializando CastContext: ${e.message}")
+    private val mediaRouter = MediaRouter.getInstance(appContext)
+    private val castSelector = MediaRouteSelector.Builder()
+        .addControlCategory(CastMediaControlIntent.categoryForCast("CC1AD845"))
+        .build()
+
+    // Store RouteInfo to select it later
+    private val castRoutesMap = mutableMapOf<String, MediaRouter.RouteInfo>()
+
+    // Callback that will be triggered when the session is started
+    private var pendingPermissionRequest: ((Intent) -> Unit)? = null
+
+    private val castSessionListener = object : SessionManagerListener<CastSession> {
+        override fun onSessionStarted(session: CastSession, sessionId: String) {
+            Log.d(TAG, "CastSession started: $sessionId")
+            pendingPermissionRequest?.let { request ->
+                val projectionManager = appContext.getSystemService(Context.MEDIA_PROJECTION_SERVICE)
+                        as android.media.projection.MediaProjectionManager
+                request(projectionManager.createScreenCaptureIntent())
+            }
+            pendingPermissionRequest = null
+        }
+
+        override fun onSessionStarting(session: CastSession) {}
+        override fun onSessionStartFailed(session: CastSession, error: Int) {
+            Log.e(TAG, "CastSession failed to start: $error")
+            pendingPermissionRequest = null
+            _selectedRoute.value = null
+        }
+        override fun onSessionEnding(session: CastSession) {}
+        override fun onSessionEnded(session: CastSession, error: Int) {
+            stopMirroring()
+        }
+        override fun onSessionResumed(session: CastSession, wasSuspended: Boolean) {}
+        override fun onSessionResuming(session: CastSession, sessionId: String) {}
+        override fun onSessionResumeFailed(session: CastSession, error: Int) {}
+        override fun onSessionSuspended(session: CastSession, reason: Int) {}
+    }
+
+    private val mediaRouterCallback = object : MediaRouter.Callback() {
+        override fun onRouteAdded(router: MediaRouter, route: MediaRouter.RouteInfo) {
+            if (route.matchesSelector(castSelector)) {
+                val mirrorRoute = MirrorRoute(
+                    id = "cast_${route.id}",
+                    name = route.name,
+                    description = "Chromecast",
+                    protocol = DeviceProtocol.CHROMECAST
+                )
+                castRoutesMap[mirrorRoute.id] = route
+                _availableRoutes.update { current ->
+                    if (current.none { it.id == mirrorRoute.id }) current + mirrorRoute else current
+                }
+            }
+        }
+
+        override fun onRouteRemoved(router: MediaRouter, route: MediaRouter.RouteInfo) {
+            _availableRoutes.update { current ->
+                current.filter { it.id != "cast_${route.id}" }
+            }
         }
     }
 
@@ -66,15 +123,36 @@ class MirroringViewModel(context: Context) : ViewModel() {
     private val _selectedRoute = MutableStateFlow<MirrorRoute?>(null)
     val selectedRoute: StateFlow<MirrorRoute?> = _selectedRoute.asStateFlow()
 
+    private val _isReceiverConnected = MutableStateFlow(false)
+    val isReceiverConnected: StateFlow<Boolean> = _isReceiverConnected.asStateFlow()
+
     private var nsdJob      : Job? = null
     private var miracastJob : Job? = null
     private var dlnaJob     : Job? = null
 
     init {
-        // Give the OS a moment to settle permissions and network state
+        try {
+            castContext = CastContext.getSharedInstance(appContext)
+            castContext?.sessionManager?.addSessionManagerListener(castSessionListener, CastSession::class.java)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error inicializando CastContext: ${e.message}")
+        }
+        
+        // Registrar MediaRouter inmediatamente en el hilo principal (Main Thread)
+        mediaRouter.addCallback(castSelector, mediaRouterCallback, MediaRouter.CALLBACK_FLAG_REQUEST_DISCOVERY)
+        
         viewModelScope.launch {
             delay(1000)
             startDiscovery()
+        }
+        observeReceiverStatus()
+    }
+
+    private fun observeReceiverStatus() {
+        viewModelScope.launch {
+            MirroringService.activeClients.collectLatest { count ->
+                _isReceiverConnected.value = count > 0
+            }
         }
     }
 
@@ -106,9 +184,30 @@ class MirroringViewModel(context: Context) : ViewModel() {
         _selectedRoute.value = route
         Log.d(TAG, "Route selected: ${route.name} (${route.protocol.displayName})")
 
-        // Si es Chromecast, el SDK maneja la selección internamente a través de MediaRouter
-        // pero nosotros disparamos el MediaProjection para capturar la pantalla.
+        if (route.protocol == DeviceProtocol.CHROMECAST) {
+            // Intentamos buscar la ruta por ID o por Nombre (para sincronizar NSD con el SDK)
+            var castRoute = castRoutesMap[route.id]
+            
+            if (castRoute == null) {
+                // Búsqueda de emergencia por nombre en todas las rutas del MediaRouter
+                castRoute = mediaRouter.routes.find { it.name == route.name }
+                if (castRoute != null) {
+                    Log.d(TAG, "Found matching MediaRouter route by name: ${route.name}")
+                    castRoutesMap[route.id] = castRoute
+                }
+            }
+
+            if (castRoute != null) {
+                pendingPermissionRequest = onPermissionRequired
+                mediaRouter.selectRoute(castRoute)
+                Log.d(TAG, "Chromecast route selected in MediaRouter... waiting for session")
+                return 
+            } else {
+                Log.w(TAG, "Could not find MediaRouter.RouteInfo for ${route.name}. Falling back to basic projection.")
+            }
+        }
         
+        // Default (DLNA, AirPlay, or Chromecast fallback)
         val projectionManager = appContext.getSystemService(Context.MEDIA_PROJECTION_SERVICE)
                 as android.media.projection.MediaProjectionManager
         onPermissionRequired(projectionManager.createScreenCaptureIntent())
@@ -131,17 +230,44 @@ class MirroringViewModel(context: Context) : ViewModel() {
             appContext.startService(serviceIntent)
         }
 
-        // 2. If it's a DLNA device, command it to play our local stream
-        if (route.protocol == DeviceProtocol.DLNA) {
-            viewModelScope.launch {
-                delay(1500) // Give service/server a moment to start
-                val localIp = getLocalIpAddress()
-                if (localIp != null) {
-                    val streamUrl = "http://$localIp:8080/live.ts"
-                    dlnaDiscovery.castToDevice(route.id, streamUrl)
-                } else {
-                    Log.e(TAG, "Could not determine local IP for DLNA cast")
+        // 2. Load stream URL in the receiver
+        viewModelScope.launch {
+            delay(3000) // Aumentamos el tiempo para asegurar que el servidor Ktor esté listo
+            val localIp = getLocalIpAddress()
+            if (localIp == null) {
+                Log.e(TAG, "No se pudo obtener IP local para el cast")
+                return@launch
+            }
+            val streamUrl = "http://$localIp:8080/live.ts"
+            Log.d(TAG, "Stream URL preparado: $streamUrl")
+
+            if (route.protocol == DeviceProtocol.DLNA) {
+                dlnaDiscovery.castToDevice(route.id, streamUrl)
+            } else if (route.protocol == DeviceProtocol.CHROMECAST) {
+                val castSession = castContext?.sessionManager?.currentCastSession
+                if (castSession == null) {
+                    Log.e(TAG, "No hay sesión Cast activa")
+                    return@launch
                 }
+
+                val mediaInfo = com.google.android.gms.cast.MediaInfo.Builder(streamUrl)
+                    .setStreamType(com.google.android.gms.cast.MediaInfo.STREAM_TYPE_LIVE)
+                    .setContentType("video/mp2t")
+                    .build()
+
+                val loadRequest = com.google.android.gms.cast.MediaLoadRequestData.Builder()
+                    .setMediaInfo(mediaInfo)
+                    .build()
+
+                castSession.remoteMediaClient?.load(loadRequest)
+                    ?.setResultCallback { result ->
+                        if (!result.status.isSuccess) {
+                            Log.e(TAG, "Cast load FAILED: ${result.status.statusMessage} (code ${result.status.statusCode})")
+                        } else {
+                            Log.d(TAG, "Cast load SUCCESS")
+                        }
+                    }
+                Log.d(TAG, "Cargando stream en Chromecast: $streamUrl")
             }
         }
     }
@@ -176,14 +302,15 @@ class MirroringViewModel(context: Context) : ViewModel() {
         nsdJob?.cancel()
         miracastJob?.cancel()
         dlnaJob?.cancel()
+        mediaRouter.removeCallback(mediaRouterCallback)
+        castContext?.sessionManager?.removeSessionManagerListener(castSessionListener, CastSession::class.java)
         super.onCleared()
     }
 
     // ─── Private ─────────────────────────────────────────────────────────────
 
     /**
-     * Collects AirPlay + Chromecast devices from NSD.
-     * Each emission is a single new device → we add it if not already present.
+     * Collects AirPlay devices from NSD. (Chromecast now handled by MediaRouter)
      */
     private fun startNsdDiscovery() {
         nsdJob = viewModelScope.launch {
@@ -193,9 +320,12 @@ class MirroringViewModel(context: Context) : ViewModel() {
                     e.printStackTrace()
                 }
                 .collect { route ->
+                    // YA NO IGNORAMOS CHROMECAST de NSD. Se mostrarán si el SDK no los encuentra.
+                    // Si el SDK ya los tiene (prefijo 'cast_'), evitamos duplicados.
+                    
                     Log.d(TAG, "NSD device found: ${route.name} (${route.protocol.displayName}) @ ${route.ipAddress}:${route.port}")
                     _availableRoutes.update { current ->
-                        if (current.none { it.id == route.id }) current + route else current
+                        if (current.none { it.id == route.id || it.name == route.name }) current + route else current
                     }
                 }
         }

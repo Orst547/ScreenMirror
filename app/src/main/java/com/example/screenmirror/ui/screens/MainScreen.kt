@@ -37,6 +37,7 @@ import com.example.screenmirror.ui.viewmodel.MirroringViewModel
 fun MainScreen(viewModel: MirroringViewModel) {
     val availableRoutes by viewModel.availableRoutes.collectAsState()
     val isMirroring by viewModel.isMirroring.collectAsState()
+    val isReceiverConnected by viewModel.isReceiverConnected.collectAsState()
     val selectedRoute by viewModel.selectedRoute.collectAsState()
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
 
@@ -122,7 +123,8 @@ fun MainScreen(viewModel: MirroringViewModel) {
                         items(availableRoutes, key = { it.id }) { route ->
                             EnhancedRouteCard(
                                 route = route,
-                                isSelected = selectedRoute?.id == route.id && isMirroring
+                                isSelected = selectedRoute?.id == route.id && isMirroring,
+                                isReceiverConnected = selectedRoute?.id == route.id && isReceiverConnected
                             ) {
                                 viewModel.onRouteSelected(route) { intent ->
                                     projectionLauncher.launch(intent)
@@ -137,7 +139,12 @@ fun MainScreen(viewModel: MirroringViewModel) {
 }
 
 @Composable
-fun EnhancedRouteCard(route: MirrorRoute, isSelected: Boolean, onClick: () -> Unit) {
+fun EnhancedRouteCard(
+    route: MirrorRoute, 
+    isSelected: Boolean, 
+    isReceiverConnected: Boolean = false,
+    onClick: () -> Unit
+) {
     val (icon, color) = when (route.protocol) {
         DeviceProtocol.CHROMECAST -> Icons.Rounded.Cast    to Color(0xFF4285F4) // Google Blue
         DeviceProtocol.AIRPLAY   -> Icons.Rounded.Airplay  to Color(0xFF555555) // Neutral dark
@@ -175,7 +182,8 @@ fun EnhancedRouteCard(route: MirrorRoute, isSelected: Boolean, onClick: () -> Un
                 Icon(
                     imageVector = if (isSelected) Icons.Rounded.CastConnected else icon,
                     contentDescription = null,
-                    tint = if (isSelected) MaterialTheme.colorScheme.onPrimaryContainer else color,
+                    tint = if (isSelected) MaterialTheme.colorScheme.onPrimaryContainer 
+                           else color,
                     modifier = Modifier.size(28.dp)
                 )
             }
@@ -207,11 +215,27 @@ fun EnhancedRouteCard(route: MirrorRoute, isSelected: Boolean, onClick: () -> Un
             }
 
             if (isSelected) {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(20.dp),
-                    strokeWidth = 2.dp,
-                    color = MaterialTheme.colorScheme.onPrimaryContainer
-                )
+                if (isReceiverConnected) {
+                    Surface(
+                        color = Color.Red,
+                        shape = RoundedCornerShape(4.dp),
+                        modifier = Modifier.padding(start = 8.dp)
+                    ) {
+                        Text(
+                            text = "LIVE",
+                            color = Color.White,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                        )
+                    }
+                } else {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(20.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer
+                    )
+                }
             } else {
                 Icon(
                     Icons.Rounded.ChevronRight,

@@ -32,6 +32,12 @@ import io.ktor.utils.io.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.collect
 import java.io.OutputStream
 import java.nio.ByteBuffer
 
@@ -49,10 +55,18 @@ class MirroringService : Service() {
     private var encoderThread: HandlerThread? = null
     private var encoderHandler: Handler? = null
     
+    companion object {
+        private val _activeClients = MutableStateFlow(0)
+        val activeClients: StateFlow<Int> = _activeClients.asStateFlow()
+    }
+    
     // Ktor Server & Muxing
     private var ktorServer: EmbeddedServer<*, *>? = null
-    // Canal de alto rendimiento para los paquetes TS (evita el lag de las coroutines por cada bloque)
-    private val tsPacketChannel = Channel<ByteArray>(capacity = 128, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+    // Flujo compartido para que múltiples clientes reciban el mismo video sin "robar" paquetes
+    private val tsPacketFlow = MutableSharedFlow<ByteArray>(
+        extraBufferCapacity = 128, 
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
     private val tsPacketCount = java.util.concurrent.atomic.AtomicInteger(0)
     private var muxer: MpegTsMuxer? = null
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -67,13 +81,15 @@ class MirroringService : Service() {
     private fun setupMuxer() {
         // El Muxer escribe a un OutputStream que envía directamente al Canal
         val broadcastStream = object : OutputStream() {
-            override fun write(b: Int) { /* unused */ }
+            override fun write(b: Int) {
+                // Fallback byte-a-byte (protección ante JVM interna)
+                tsPacketFlow.tryEmit(byteArrayOf(b.toByte()))
+            }
             override fun write(b: ByteArray, off: Int, len: Int) {
                 val chunk = b.copyOfRange(off, off + len)
-                // Usamos trySend para que la escritura sea instantánea y no bloquee el hilo del encoder
-                if (tsPacketChannel.trySend(chunk).isSuccess) {
-                    tsPacketCount.incrementAndGet()
-                }
+                // Emitimos al flujo compartido; si no hay suscriptores, se descarta (ahorra CPU)
+                tsPacketFlow.tryEmit(chunk)
+                tsPacketCount.incrementAndGet() // Contador real de paquetes emitidos
             }
         }
         muxer = MpegTsMuxer(broadcastStream)
@@ -83,15 +99,28 @@ class MirroringService : Service() {
         val server = embeddedServer(CIO, port = 8080) {
             routing {
                 get("/live.ts") {
-                    call.respondBytesWriter(contentType = io.ktor.http.ContentType.Video.MPEG) {
-                        for (chunk in tsPacketChannel) {
-                            tsPacketCount.decrementAndGet()
-                            try {
+                    _activeClients.value += 1
+                    
+                    // Forzamos un frame de sincronización en el encoder y headers en el muxer
+                    requestSyncFrame()
+                    muxer?.forceNextHeaders()
+                    Log.d("MirroringService", "Cliente conectado al stream. Solicitando I-Frame...")
+
+                    // Cabeceras de compatibilidad y CORS manual
+                    call.response.header("Access-Control-Allow-Origin", "*")
+                    call.response.header("Cache-Control", "no-cache, no-store, must-revalidate")
+                    call.response.header("Connection", "keep-alive")
+
+                    call.respondBytesWriter(contentType = io.ktor.http.ContentType("video", "mp2t")) {
+                        try {
+                            tsPacketFlow.collect { chunk ->
                                 writeFully(chunk)
                                 flush()
-                            } catch (e: Exception) {
-                                break // Desconexión del cliente
                             }
+                        } catch (e: Exception) {
+                            Log.d("MirroringService", "Cliente desconectado del stream: ${e.message}")
+                        } finally {
+                            _activeClients.update { (it - 1).coerceAtLeast(0) }
                         }
                     }
                 }
@@ -158,15 +187,14 @@ class MirroringService : Service() {
 
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, targetWidth, targetHeight)
         format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-        format.setInteger(MediaFormat.KEY_BIT_RATE, 4000000) // Bajamos a 4Mbps para mayor estabilidad
+        format.setInteger(MediaFormat.KEY_BIT_RATE, 2500000) // Bajamos a 2.5Mbps iniciales
         format.setInteger(MediaFormat.KEY_FRAME_RATE, 30)
-        format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+        format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1) // Enviamos I-Frame cada segundo para mayor rapidez
+        
+        // Perfil Baseline en la configuración inicial (sin Level para evitar BAD_INDEX)
+        format.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
 
         mediaCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-        
-        // Forzamos AVCProfileBaseline para maximizar compatibilidad y evitar el bug de Media3
-        format.setInteger(MediaFormat.KEY_PROFILE, CodecProfileLevel.AVCProfileBaseline)
-        format.setInteger(MediaFormat.KEY_LEVEL, CodecProfileLevel.AVCLevel41)
         
         mediaCodec?.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         inputSurface = mediaCodec?.createInputSurface()
@@ -209,20 +237,22 @@ class MirroringService : Service() {
             override fun run() {
                 if (!isStreaming) return
 
-                val bufferInfo = MediaCodec.BufferInfo()
-                val outputBufferIndex = mediaCodec?.dequeueOutputBuffer(bufferInfo, 10000) ?: -1
-                
-                if (outputBufferIndex >= 0) {
-                    val outputBuffer = mediaCodec?.getOutputBuffer(outputBufferIndex)
+                try {
+                    val bufferInfo = MediaCodec.BufferInfo()
+                    val outputBufferIndex = mediaCodec?.dequeueOutputBuffer(bufferInfo, 10000) ?: -1
                     
-                    if (outputBuffer != null) {
-                        // AQUÍ ES DONDE SE ENVIARÍAN LOS DATOS
-                        // Para AirPlay: Enviar vía RTSP/TCP
-                        // Para Cast: Enviar vía WebRTC o HTTP Stream
-                        sendDataToRemoteDevice(outputBuffer, bufferInfo)
+                    if (outputBufferIndex >= 0) {
+                        val outputBuffer = mediaCodec?.getOutputBuffer(outputBufferIndex)
+                        
+                        if (outputBuffer != null) {
+                            sendDataToRemoteDevice(outputBuffer, bufferInfo)
+                        }
+                        
+                        mediaCodec?.releaseOutputBuffer(outputBufferIndex, false)
                     }
-                    
-                    mediaCodec?.releaseOutputBuffer(outputBufferIndex, false)
+                } catch (e: IllegalStateException) {
+                    // El codec se cerró mientras esperábamos, detenemos el loop pacíficamente
+                    isStreaming = false
                 }
                 
                 if (isStreaming) {
@@ -259,9 +289,21 @@ class MirroringService : Service() {
         }
     }
 
+    private fun requestSyncFrame() {
+        try {
+            val params = android.os.Bundle().apply {
+                putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+            }
+            mediaCodec?.setParameters(params)
+        } catch (e: Exception) {
+            Log.e("MirroringService", "Error solicitando Sync Frame: ${e.message}")
+        }
+    }
+
     private fun sendDataToRemoteDevice(buffer: ByteBuffer, bufferInfo: MediaCodec.BufferInfo) {
         val isConfig = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
-        muxer?.writeVideoFrame(buffer, bufferInfo.presentationTimeUs, isConfig)
+        val isKeyFrame = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+        muxer?.writeVideoFrame(buffer, bufferInfo.presentationTimeUs, isConfig, isKeyFrame)
     }
 
     private fun createNotificationChannel() {

@@ -5,14 +5,8 @@ import java.io.OutputStream
 import java.nio.ByteBuffer
 
 /**
- * A minimal MPEG-TS Muxer that wraps H.264 NAL units (AnnexB) into TS packets.
- * This is a lightweight implementation for local network mirroring.
- * 
- * Flow:
- * 1. Receive H.264 NAL unit from MediaCodec.
- * 2. Wrap into PES (Packetized Elementary Stream) header with PTS.
- * 3. Split into 188-byte TS packets.
- * 4. Periodically insert PAT and PMT packets.
+ * A minimal MPEG-TS Muxer that wraps H.264 NAL units into TS packets.
+ * This implementation enforces the strict MPEG-TS standard required by Chromecast (CRC32, CC, PTS).
  */
 class MpegTsMuxer(private val output: OutputStream) {
 
@@ -25,34 +19,52 @@ class MpegTsMuxer(private val output: OutputStream) {
         private const val PID_PAT = 0x0000
         private const val PID_PMT = 0x1000
         private const val PID_VIDEO = 0x0100
-        
-        // Stream types
         private const val STREAM_TYPE_H264 = 0x1B.toByte()
     }
 
-    private var videoCc: Int = 0 // Continuity Counter for Video
-    private var patPmtCc: Int = 0 // Continuity Counter for Tables
-    private var frameCount: Int = 0
+    private var videoCc = 0
+    private var patCc = 0
+    private var pmtCc = 0
+    private var frameCount = 0
+    private var forceHeaders = false
+    
+    // Buffer para SPS/PPS (Codec Config)
+    private var configBuffer: ByteArray? = null
+
+    fun forceNextHeaders() {
+        forceHeaders = true
+    }
 
     /**
      * Called when a new H.264 NAL unit is ready.
      * ptsUs: Presentation timestamp in microseconds.
      */
-    fun writeVideoFrame(data: ByteBuffer, ptsUs: Long, isConfigFrame: Boolean = false) {
-        if (isConfigFrame || frameCount % 30 == 0) {
-            writePat()
-            writePmt()
+    fun writeVideoFrame(data: ByteBuffer, ptsUs: Long, isConfigFrame: Boolean = false, isKeyFrame: Boolean = false) {
+        if (isConfigFrame) {
+            val config = ByteArray(data.remaining())
+            data.get(config)
+            configBuffer = config
+            Log.d(TAG, "Codec Config (SPS/PPS) buffered")
+            return // No enviamos la config sola, esperamos al siguiente frame
         }
 
-        val frameData = ByteArray(data.remaining())
+        if (forceHeaders || frameCount % 30 == 0 || isKeyFrame) {
+            writePat()
+            writePmt()
+            forceHeaders = false
+        }
+
+        var frameData = ByteArray(data.remaining())
         data.get(frameData)
         
-        // 1. Create PES packet
+        // Si es un Key Frame, le pegamos la configuración (SPS/PPS) al inicio (Annex B)
+        if (isKeyFrame && configBuffer != null) {
+            frameData = configBuffer!! + frameData
+            Log.d(TAG, "Prepending SPS/PPS to Key Frame")
+        }
+
         val pesPacket = createVideoPesPacket(frameData, ptsUs)
-        
-        // 2. Fragment into TS packets
         fragmentIntoTsPackets(pesPacket, PID_VIDEO)
-        
         frameCount++
     }
 
@@ -62,20 +74,32 @@ class MpegTsMuxer(private val output: OutputStream) {
         
         // TS Header (4 bytes)
         packet[pos++] = SYNC_BYTE
-        packet[pos++] = (0x40 or (PID_PAT shr 8)).toByte() // Payload start indicator + PID
+        packet[pos++] = (0x40 or (PID_PAT shr 8)).toByte() // PUSI + PID
         packet[pos++] = (PID_PAT and 0xFF).toByte()
-        packet[pos++] = (0x10 or (patPmtCc % 16)).toByte() // Adaption field=0, payload=1 + CC
+        packet[pos++] = (0x10 or (patCc % 16)).toByte() // Adaption=0, Payload=1 + CC
+        patCc++
 
-        // PAT Payload (Pointer field + Table)
         packet[pos++] = 0x00 // Pointer field
         
-        // Minimal PAT: Table ID 0, Section Length 13, Transport Stream ID 1, Version 0, Current 1
-        val pat = byteArrayOf(
-            0x00, (0xB0).toByte(), 0x0D, 0x00, 0x01, (0xC1).toByte(), 0x00, 0x00, 
-            0x00, 0x01, (0xE0 or (PID_PMT shr 8)).toByte(), (PID_PMT and 0xFF).toByte(),
-            0x00, 0x00, 0x00, 0x00 // CRC placeholder (Not strictly needed for some naive players but good for spec)
+        // PAT table section (13 bytes before CRC)
+        val patSection = byteArrayOf(
+            0x00,                      // Table ID
+            (0xB0).toByte(), 0x0D,     // Section syntax indicator + Length (13)
+            0x00, 0x01,                // Transport Stream ID
+            (0xC1).toByte(),           // Version 0, Current=1
+            0x00, 0x00,                // Section Number / Last
+            0x00, 0x01,                // Program Number 1
+            (0xE0 or (PID_PMT shr 8)).toByte(), (PID_PMT and 0xFF).toByte()
         )
-        System.arraycopy(pat, 0, packet, pos, pat.size)
+        
+        val crc = calculateCrc32(patSection)
+        System.arraycopy(patSection, 0, packet, pos, patSection.size)
+        pos += patSection.size
+        
+        packet[pos++] = (crc shr 24).toByte()
+        packet[pos++] = (crc shr 16).toByte()
+        packet[pos++] = (crc shr 8).toByte()
+        packet[pos++] = (crc and 0xFF).toByte()
         
         output.write(packet)
     }
@@ -84,65 +108,66 @@ class MpegTsMuxer(private val output: OutputStream) {
         val packet = ByteArray(TS_PACKET_SIZE) { 0xFF.toByte() }
         var pos = 0
         
-        // TS Header (4 bytes)
         packet[pos++] = SYNC_BYTE
         packet[pos++] = (0x40 or (PID_PMT shr 8)).toByte()
         packet[pos++] = (PID_PMT and 0xFF).toByte()
-        packet[pos++] = (0x10 or (patPmtCc % 16)).toByte()
-        patPmtCc++
+        packet[pos++] = (0x10 or (pmtCc % 16)).toByte()
+        pmtCc++
 
         packet[pos++] = 0x00 // Pointer field
         
-        // Minimal PMT: Table ID 2, Video Stream Type 0x1B
-        val pmt = byteArrayOf(
-            0x02, (0xB0).toByte(), 0x12, 0x00, 0x01, (0xC1).toByte(), 0x00, 0x00, 
+        // PMT table section (18 bytes before CRC)
+        val pmtSection = byteArrayOf(
+            0x02,                      // Table ID
+            (0xB0).toByte(), 0x12,     // Section syntax indicator + Length (18)
+            0x00, 0x01,                // Program Number
+            (0xC1).toByte(),           // Version 0, Current=1
+            0x00, 0x00,                // Section Number / Last
             (0xE0 or (PID_VIDEO shr 8)).toByte(), (PID_VIDEO and 0xFF).toByte(), // PCR PID
-            (0xF0).toByte(), 0x00, // Program Info length
+            (0xF0).toByte(), 0x00,     // Program Info Length=0
             STREAM_TYPE_H264, (0xE0 or (PID_VIDEO shr 8)).toByte(), (PID_VIDEO and 0xFF).toByte(),
-            (0xF0).toByte(), 0x00, // ES Info length
-            0x00, 0x00, 0x00, 0x00 // CRC placeholder
+            (0xF0).toByte(), 0x00      // ES Info Length=0
         )
-        System.arraycopy(pmt, 0, packet, pos, pmt.size)
+        
+        val crc = calculateCrc32(pmtSection)
+        System.arraycopy(pmtSection, 0, packet, pos, pmtSection.size)
+        pos += pmtSection.size
+        
+        packet[pos++] = (crc shr 24).toByte()
+        packet[pos++] = (crc shr 16).toByte()
+        packet[pos++] = (crc shr 8).toByte()
+        packet[pos++] = (crc and 0xFF).toByte()
         
         output.write(packet)
     }
 
     private fun createVideoPesPacket(frame: ByteArray, ptsUs: Long): ByteArray {
-        val pts = (ptsUs * 9 / 100) // Convert to 90kHz clock
-        
-        // PES Header (at least 14 bytes for video with PTS)
-        // 00 00 01 
-        // Stream ID (E0 for Video)
-        // PES Packet Length (00 00 for unbounded or length)
-        // Flags (80 80 for PTS only)
-        // Header Data Length (05 for PTS)
-        // PTS (5 bytes)
+        val pts = ptsUs * 90L / 1000L // Microseconds to 90kHz without overflow
         
         val header = ByteArray(14)
         header[0] = 0x00
         header[1] = 0x00
         header[2] = 0x01
-        header[3] = 0xE0.toByte() // Video stream 0
+        header[3] = 0xE0.toByte() // Video stream id
         
-        val length = frame.size + 14 - 6
-        header[4] = (length shr 8).toByte()
-        header[5] = (length and 0xFF).toByte()
+        // Para video en vivo, pesPacketLength se suele poner a 0 (unbounded)
+        // Esto evita que la TV busque el final de un paquete que es infinito.
+        header[4] = 0x00
+        header[5] = 0x00
         
         header[6] = 0x80.toByte() // 10xxxxxx
         header[7] = 0x80.toByte() // PTS only
         header[8] = 0x05 // Header data length
         
-        // PTS coding (33 bits)
-        header[9] = (0x21 or ((pts shr 29) and 0x0E).toInt()).toByte()
-        header[10] = ((pts shr 22) and 0xFF).toByte()
-        header[11] = (((pts shr 14) and 0xFE) or 1).toByte()
-        header[12] = ((pts shr 7) and 0xFF).toByte()
-        header[13] = (((pts shl 1) and 0xFE) or 1).toByte()
+        // PTS coding (33 bits) — ISO 13818-1 Table 2-22
+        // Bits de marcador (marker_bit=1) OBLIGATORIOS en posiciones pares
+        header[9]  = (0x21 or ((pts shr 29) and 0x0E).toInt()).toByte()  // '0010' + PTS[32..30] + marker
+        header[10] = ((pts shr 22) and 0xFF).toByte()                    // PTS[29..22]
+        header[11] = (((pts shr 14) and 0xFE) or 0x01).toByte()         // PTS[21..15] + marker
+        header[12] = ((pts shr 7) and 0xFF).toByte()                     // PTS[14..7]
+        header[13] = (((pts shl 1) and 0xFE) or 0x01).toByte()          // PTS[6..0] + marker
         
-        val pes = ByteArray(header.size + frame.size)
-        System.arraycopy(header, 0, pes, 0, header.size)
-        System.arraycopy(frame, 0, pes, header.size, frame.size)
-        return pes
+        return header + frame
     }
 
     private fun fragmentIntoTsPackets(pes: ByteArray, pid: Int) {
@@ -151,35 +176,51 @@ class MpegTsMuxer(private val output: OutputStream) {
             val packet = ByteArray(TS_PACKET_SIZE) { 0xFF.toByte() }
             var pos = 0
             
-            // Header
             packet[pos++] = SYNC_BYTE
-            var flags = (pid shr 8)
-            if (offset == 0) flags = flags or 0x40 // Payload Unit Start Indicator
-            packet[pos++] = flags.toByte()
+            var high = (pid shr 8)
+            if (offset == 0) high = high or 0x40 
+            packet[pos++] = high.toByte()
             packet[pos++] = (pid and 0xFF).toByte()
-            packet[pos++] = (0x10 or (videoCc % 16)).toByte()
-            videoCc++
             
             val remaining = pes.size - offset
-            val payloadToCopy = Math.min(remaining, TS_PAYLOAD_SIZE)
+            val payloadToCopy = minOf(remaining, TS_PAYLOAD_SIZE)
             
-            // If we have less than 184 bytes, we need an adaptation field for padding
             if (payloadToCopy < TS_PAYLOAD_SIZE) {
-                // Adjust header to include adaptation field
-                packet[3] = (packet[3].toInt() or 0x20).toByte() // Adaptation field flag
-                
+                // Adaptation field for padding
                 val paddingSize = TS_PAYLOAD_SIZE - payloadToCopy
-                packet[pos++] = (paddingSize - 1).toByte() // Adaptation length
+                packet[pos++] = (0x30 or (videoCc % 16)).toByte() // Adaptation + Payload
+                videoCc++
+                packet[pos++] = (paddingSize - 1).toByte() // Length
                 if (paddingSize > 1) {
-                    packet[pos++] = 0x00 // No flags
-                    // Rest is filled with FF by default initialization
+                    packet[pos++] = 0x00 // Flags
                 }
                 pos = TS_PACKET_SIZE - payloadToCopy
+            } else {
+                packet[pos++] = (0x10 or (videoCc % 16)).toByte() // Payload only
+                videoCc++
             }
             
             System.arraycopy(pes, offset, packet, pos, payloadToCopy)
             output.write(packet)
             offset += payloadToCopy
         }
+    }
+
+    /**
+     * Bitwise implementation of bitwise CRC32 for MPEG-TS (MPEG-2 Annex B).
+     * Polynomial: 0x04C11DB7, Init: 0xFFFFFFFF, No Ref, No XOR out.
+     */
+    private fun calculateCrc32(data: ByteArray): Int {
+        var crc = 0xFFFFFFFF.toInt()
+        for (b in data) {
+            crc = crc xor (b.toInt() shl 24)
+            repeat(8) {
+                crc = if (crc and 0x80000000.toInt() != 0)
+                    (crc shl 1) xor 0x04C11DB7
+                else
+                    crc shl 1
+            }
+        }
+        return crc
     }
 }
